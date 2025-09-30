@@ -1,0 +1,597 @@
+c<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Moon WebXR Demo</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="icon" href="./favicon.ico" type="image/x-icon">
+  <style>
+    html,body { margin:0; height:100%; overflow:hidden; background:#000; }
+    canvas { display:block; }
+    #hint {
+      position:fixed; left:12px; bottom:12px; right:12px;
+      color:#ddd; font-family:system-ui, sans-serif; font-size:14px; opacity:.9;
+      background:rgba(0,0,0,.35); padding:8px 10px; border-radius:8px;
+      line-height:1.35; z-index:10;
+    }
+    #hud {
+      position:fixed; right:12px; top:12px; z-index:10;
+      background:rgba(0,0,0,.45); color:#eee; font:12px system-ui,sans-serif;
+      padding:8px 10px; border-radius:8px; min-width:320px;
+      display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    }
+    #hud b { font-weight:600 }
+    #hud button {
+      background:#1e1e1e; color:#eee; border:1px solid #555; border-radius:6px;
+      padding:4px 8px; cursor:pointer;
+    }
+    #hud .row { display:flex; gap:8px; width:100%; align-items:center; }
+    #hud .row label { opacity:.8 }
+  </style>
+
+  <!-- Import map -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+<div id="hint">
+  Desktop: drag = look, <b>WASD/←→↑↓</b> = move, <b>P</b> = screenshot, <b>1/2</b> = sun azimuth, <b>3/4</b> = sun elevation.<br/>
+  VR: <b>Trigger</b>=aim+teleport, <b>Left stick</b>=move, <b>Left squeeze</b>=sun azimuth –, <b>Right squeeze</b>=sun azimuth +, <b>LS click</b>=sun elev –, <b>RS click</b>=sun elev +.
+</div>
+<div id="hud">
+  <div class="row"><span id="hudText">h: –, eyeY: –</span></div>
+  <div class="row">
+    <button id="toggleLit" title="Toggle lighting (PBR vs Unlit) [L]">Lighting: <b id="litMode">Auto</b></button>
+    <button id="toggleSite" title="Switch dataset">Site selection: <b id="siteLabel">Haworth Crater LROC NAC</b></button>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+/* -------- HUD -------- */
+const hudText = document.getElementById('hudText');
+const litLabel = document.getElementById('litMode');
+const siteLabel = document.getElementById('siteLabel');
+function updateHUD(h, eyeY) {
+  if (!isFinite(h) || !isFinite(eyeY)) return;
+  hudText.textContent = `h: ${h.toFixed(2)} m   eyeY: ${eyeY.toFixed(2)} m`;
+}
+
+/* -------- GLOBAL SETTINGS / SITES -------- */
+const metersPerPixel = 0.0625;   // 6.25 cm/px (both sites)
+const eyeHeight = 3;
+
+const SITES = [
+  { name:'Haworth Crater LROC NAC',      colorUrl:'./image.jpg',  dtmUrl:'./dtm.png',  ZMIN:0, ZMAX:10 },
+  { name:'Shackleton Crater LROC NAC',   colorUrl:'./image2.jpg', dtmUrl:'./dtm2.png', ZMIN:0, ZMAX:12.5 }
+];
+let currentSiteIndex = 0;
+
+/* --- DEVICE DETECTION (Quest + iPad default to UNLIT) --- */
+const ua = navigator.userAgent || "";
+const isQuest = /OculusBrowser|Quest|Meta Quest/i.test(ua);
+const isIPadLike = /iPad/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+let forceUnlit = (isQuest || isIPadLike);
+litLabel.textContent = forceUnlit ? 'Unlit' : 'PBR';
+
+/* -------- RENDERER / SCENE -------- */
+const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.NoToneMapping;
+document.body.appendChild(renderer.domElement);
+
+// Avoid WebXR Layers colour-space quirks
+document.body.appendChild(VRButton.createButton(renderer, {
+  requiredFeatures: ['local-floor'],
+  optionalFeatures: ['bounded-floor']
+}));
+
+// ----- Moon sky (near-black, no fog) -----
+const MOON_TOP    = 0x02060E; // very dark blue at zenith
+const MOON_BOTTOM = 0x000000; // black near horizon
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+scene.fog = null; // no atmosphere → no distance haze
+
+// World group
+const world = new THREE.Group();
+scene.add(world);
+
+// Skydome (subtle dark gradient)
+let sky = null;
+{
+  const skyGeo = new THREE.SphereGeometry(5000, 32, 16);
+  skyGeo.scale(-1, 1, 1);
+  const skyMat = new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite:false, depthTest:false,
+    uniforms: { top:{value:new THREE.Color(MOON_TOP)}, bottom:{value:new THREE.Color(MOON_BOTTOM)}, power:{value:1.0} },
+    vertexShader: `
+      varying vec3 vWorld;
+      void main(){ vec4 wPos = modelMatrix * vec4(position,1.0); vWorld = wPos.xyz;
+                   gl_Position = projectionMatrix * viewMatrix * wPos; }`,
+    fragmentShader: `
+      varying vec3 vWorld; uniform vec3 top, bottom; uniform float power;
+      void main(){ float h = clamp(normalize(vWorld).y, 0.0, 1.0);
+                   float t = pow(h, power); gl_FragColor = vec4(mix(bottom, top, t), 1.0); }`
+  });
+  sky = new THREE.Mesh(skyGeo, skyMat);
+  sky.renderOrder = -1;
+  scene.add(sky);
+}
+
+/* -------- CAMERA & CONTROLS -------- */
+const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.01, 100000);
+scene.add(camera);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+/* -------- VR state -------- */
+let playerX = 0, playerZ = 0;
+
+/* -------- LIGHTS (for PBR) -------- */
+const hemi = new THREE.HemisphereLight(0xEEEAE5, 0x1a1a1a, 0.5); // neutral, subdued
+const sun  = new THREE.DirectionalLight(0xFFF7E6, 1.2);
+const ambient = new THREE.AmbientLight(0xffffff, 0.08);
+scene.add(hemi, sun, ambient);
+
+let sunAz = 0.7, sunEl = 0.9;
+function updateSun() {
+  const r = 1.0;
+  sun.position.set(
+    r*Math.sin(sunAz)*Math.cos(sunEl),
+    r*Math.sin(sunEl),
+    r*Math.cos(sunAz)*Math.cos(sunEl)
+  );
+}
+updateSun();
+
+/* -------- GLOBALS THAT CHANGE PER SITE -------- */
+let segX = 512, segY = segX;
+let ZMIN = 0, ZMAX = 10;
+
+let wPx = 0, hPx = 0, wM = 0, hM = 0;
+
+let colorTexPBR_current = null;
+let colorTexUnlit_current = null;
+
+let heightSampler = null;
+let heightGrid = null;
+let ground = null;
+let grid = null;
+const axes = new THREE.AxesHelper(50); world.add(axes);
+
+/* -------- LOADERS -------- */
+const loader = new THREE.TextureLoader();
+
+async function loadSRGBCanvasTexture(url, maxSize=4096) {
+  const img = await new Promise((res, rej)=>{ const im=new Image(); im.onload=()=>res(im); im.onerror=rej; im.src=url; });
+  let w = img.naturalWidth, h = img.naturalHeight;
+  if (Math.max(w,h) > maxSize) { const s = maxSize/Math.max(w,h); w = Math.round(w*s); h = Math.round(h*s); }
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0, w, h);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.anisotropy = 8;
+  tex.flipY = true; // match PBR and height sampler
+  return tex;
+}
+
+async function buildGraySampler(img) {
+  const maxSize = 4096;
+  let sw = img.naturalWidth, sh = img.naturalHeight;
+  if (Math.max(sw, sh) > maxSize) {
+    const s = maxSize / Math.max(sw, sh);
+    sw = Math.max(1, Math.round(sw * s));
+    sh = Math.max(1, Math.round(sh * s));
+  }
+  const c = document.createElement('canvas');
+  c.width = sw; c.height = sh;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, sw, sh);
+  const data = ctx.getImageData(0, 0, sw, sh).data;
+
+  function grayAtUV(u, v) {
+    u = THREE.MathUtils.clamp(u, 0, 1);
+    v = THREE.MathUtils.clamp(v, 0, 1);
+    const fx = u * (sw - 1);
+    const fy = (1 - v) * (sh - 1); // flipY to match texture sampling (flipY = true)
+    const x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const x1 = Math.min(sw - 1, x0 + 1);
+    const y1 = Math.min(sh - 1, y0 + 1);
+    const tx = fx - x0, ty = fy - y0;
+    const idx = (x, y) => (y * sw + x) * 4;
+    const g00 = data[idx(x0, y0)], g10 = data[idx(x1, y0)], g01 = data[idx(x0, y1)], g11 = data[idx(x1, y1)];
+    const g0 = g00 * (1 - tx) + g10 * tx;
+    const g1 = g01 * (1 - tx) + g11 * tx;
+    return g0 * (1 - ty) + g1 * ty; // 0..255
+  }
+  return { grayAtUV };
+}
+
+/* -------- MATERIAL FACTORIES (use current textures) -------- */
+function makePBR() {
+  return new THREE.MeshStandardMaterial({ map: colorTexPBR_current, metalness:0.0, roughness:1.0 });
+}
+function makeUnlit() {
+  const m = new THREE.MeshBasicMaterial({ map: colorTexUnlit_current, fog:false });
+  m.toneMapped = false;
+  return m;
+}
+
+/* -------- BUILD / REBUILD CURRENT SITE -------- */
+async function loadSite(idx) {
+  const site = SITES[idx];
+  currentSiteIndex = idx;
+  siteLabel.textContent = site.name;
+
+  // load color textures for both PBR & Unlit
+  const colorTexPBR = await loader.loadAsync(site.colorUrl);
+  colorTexPBR.colorSpace = THREE.SRGBColorSpace;
+  colorTexPBR.wrapS = colorTexPBR.wrapT = THREE.ClampToEdgeWrapping;
+  colorTexPBR.anisotropy = 8;
+  colorTexPBR.flipY = true;
+
+  const colorTexUnlit = await loadSRGBCanvasTexture(site.colorUrl);
+
+  // load height image
+  const heightImg = await new Promise((resolve, reject) => {
+    const img = new Image(); img.onload=()=>resolve(img); img.onerror=reject; img.src = site.dtmUrl;
+  });
+
+  // update globals
+  ZMIN = site.ZMIN; ZMAX = site.ZMAX;
+  wPx = heightImg.naturalWidth;  hPx = heightImg.naturalHeight;
+  wM  = wPx * metersPerPixel;    hM  = hPx * metersPerPixel;
+  segY = Math.max(2, Math.round(segX * (hPx / wPx)));
+
+  heightSampler = await buildGraySampler(heightImg);
+
+  // build geometry & height grid
+  const geo = new THREE.PlaneGeometry(wM, hM, segX, segY);
+  geo.rotateX(-Math.PI/2);
+
+  const pos = geo.attributes.position;
+  const uvs = geo.attributes.uv;
+  const verts = pos.count;
+  const cols = segX + 1, rows = segY + 1;
+  heightGrid = new Float32Array(cols * rows);
+
+  for (let i = 0; i < verts; i++) {
+    const u = uvs.getX(i), v = uvs.getY(i);
+    const gray = heightSampler.grayAtUV(u, v);
+    const elev = ZMIN + (gray / 255) * (ZMAX - ZMIN);
+    pos.setY(i, elev);
+    const ix = i % cols, iy = Math.floor(i / cols);
+    heightGrid[iy * cols + ix] = elev;
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+
+  // swap textures -> current, then create material/mesh
+  colorTexPBR_current?.dispose?.();
+  colorTexUnlit_current?.dispose?.();
+  colorTexPBR_current = colorTexPBR;
+  colorTexUnlit_current = colorTexUnlit;
+
+  const newGround = new THREE.Mesh(geo, forceUnlit ? makeUnlit() : makePBR());
+  if (ground) {
+    world.remove(ground);
+    ground.geometry.dispose?.();
+    ground.material.dispose?.();
+  }
+  ground = newGround;
+  world.add(ground);
+
+  // refresh helpers for new extent / height
+  if (grid) { world.remove(grid); grid.geometry.dispose?.(); }
+  grid = new THREE.GridHelper(Math.max(wM, hM), 20, 0x6aa6ff, 0x2a2a44);
+  grid.position.y = ZMIN;
+  world.add(grid);
+
+  axes.position.y = (ZMIN + ZMAX) * 0.5;
+
+  // set start position / height for this site
+  const startX = 0, startZ = 5;
+  const startH = heightFromGridAtXZ(startX, startZ);
+
+  if (!renderer.xr.isPresenting) {
+    // Desktop
+    world.position.set(0,0,0);
+    camera.position.set(startX, startH + eyeHeight, startZ);
+    controls.target.set(0, startH, 0);
+    updateHUD(startH, camera.position.y);
+  } else {
+    // In VR — relocate world so viewer stands at (startX,startZ)
+    playerX = THREE.MathUtils.clamp(startX, -wM/2 + 0.5,  wM/2 - 0.5);
+    playerZ = THREE.MathUtils.clamp(startZ, -hM/2 + 0.5,  hM/2 - 0.5);
+    const h = heightFromGridAtXZ(playerX, playerZ);
+    world.position.set(-playerX, -h, -playerZ);
+    updateHUD(h, eyeHeight);
+  }
+
+  console.log(`[Site] ${site.name}: ${wPx}×${hPx}px → ${wM.toFixed(2)}×${hM.toFixed(2)} m, Z:[${ZMIN},${ZMAX}], mesh=${segX}×${segY}`);
+}
+
+/* -------- HEIGHT FROM MESH GRID (uses globals) -------- */
+function heightFromGridAtXZ(x, z) {
+  const u = THREE.MathUtils.clamp((x / wM) + 0.5, 0, 1);
+  const v = THREE.MathUtils.clamp((z / hM) + 0.5, 0, 1);
+  const gx = u * segX, gz = v * segY;
+  const x0 = Math.floor(gx), z0 = Math.floor(gz);
+  const x1 = Math.min(segX, x0 + 1);
+  const z1 = Math.min(segY, z0 + 1);
+  const tx = gx - x0, tz = gz - z0;
+  const idx = (ix, iz) => iz * (segX + 1) + ix;
+  const h00 = heightGrid[idx(x0,z0)], h10 = heightGrid[idx(x1,z0)],
+        h01 = heightGrid[idx(x0,z1)], h11 = heightGrid[idx(x1,z1)];
+  const h0 = h00 * (1 - tx) + h10 * tx;
+  const h1 = h01 * (1 - tx) + h11 * tx;
+  return h0 * (1 - tz) + h1 * tz;
+}
+
+/* -------- INITIAL LOAD (default site 0) -------- */
+await loadSite(0);
+
+/* -------- DESKTOP MOVEMENT -------- */
+const keys = new Set();
+addEventListener('keydown', e => keys.add(e.code));
+addEventListener('keyup',   e => keys.delete(e.code));
+
+function desktopMove(dt) {
+  const speed = 30; // m/s
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir); dir.y = 0; dir.normalize();
+  const right = new THREE.Vector3().crossVectors(dir, new THREE.Vector3(0,1,0));
+
+  let v = new THREE.Vector3();
+  if (keys.has('KeyW') || keys.has('ArrowUp'))    v.add(dir);
+  if (keys.has('KeyS') || keys.has('ArrowDown'))  v.add(dir.clone().negate());
+  if (keys.has('KeyA') || keys.has('ArrowLeft'))  v.add(right.clone().negate());
+  if (keys.has('KeyD') || keys.has('ArrowRight')) v.add(right);
+
+  if (v.lengthSq() > 0) {
+    v.normalize().multiplyScalar(speed * dt);
+    camera.position.x += v.x; camera.position.z += v.z;
+    controls.target.x += v.x; controls.target.z += v.z;
+  }
+
+  const h = heightFromGridAtXZ(camera.position.x, camera.position.z);
+  const desiredY = h + eyeHeight;
+  camera.position.y = THREE.MathUtils.lerp(camera.position.y, desiredY, 0.5);
+  controls.target.y = h;
+  updateHUD(h, camera.position.y);
+}
+
+/* -------- VR: controllers & movement -------- */
+const controllerModelFactory = new XRControllerModelFactory();
+const controller0 = renderer.xr.getController(0);
+const controller1 = renderer.xr.getController(1);
+scene.add(controller0, controller1);
+
+const grip0 = renderer.xr.getControllerGrip(0);
+const grip1 = renderer.xr.getControllerGrip(1);
+grip0.add(controllerModelFactory.createControllerModel(grip0));
+grip1.add(controllerModelFactory.createControllerModel(grip1));
+scene.add(grip0, grip1);
+
+// Laser lines
+function makeLaser() {
+  const pts = [new THREE.Vector3(0,0,0), new THREE.Vector3(0,0,-1)];
+  const geom = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat  = new THREE.LineBasicMaterial({ color:0x00ffff });
+  const line = new THREE.Line(geom, mat);
+  line.name = 'laser';
+  line.scale.z = 10;
+  return line;
+}
+controller0.add(makeLaser());
+controller1.add(makeLaser());
+
+const raycaster = new THREE.Raycaster();
+const teleportMarker = new THREE.Mesh(
+  new THREE.RingGeometry(0.25, 0.3, 32),
+  new THREE.MeshBasicMaterial({ color:0x00ffff, transparent:true, opacity:0.85, side:THREE.DoubleSide })
+);
+teleportMarker.rotation.x = -Math.PI/2;
+teleportMarker.visible = false;
+world.add(teleportMarker);
+
+function intersectFromController(ctrl) {
+  const tempMat = new THREE.Matrix4().identity().extractRotation(ctrl.matrixWorld);
+  const dir = new THREE.Vector3(0,0,-1).applyMatrix4(tempMat).normalize();
+  const origin = new THREE.Vector3().setFromMatrixPosition(ctrl.matrixWorld);
+  raycaster.set(origin, dir);
+  const hits = raycaster.intersectObject(ground, true);
+  return hits.length ? hits[0] : null;
+}
+
+// Teleport
+function setupTeleportFor(ctrl) {
+  ctrl.addEventListener('selectstart', () => {
+    const line = ctrl.getObjectByName('laser'); if (line) line.material.color.set(0xffaa00);
+  });
+  ctrl.addEventListener('selectend', () => {
+    const line = ctrl.getObjectByName('laser'); if (line) line.material.color.set(0x00ffff);
+    const hit = intersectFromController(ctrl);
+    if (hit) {
+      const p = hit.point;
+      playerX = p.x - world.position.x;
+      playerZ = p.z - world.position.z;
+
+      playerX = THREE.MathUtils.clamp(playerX, -wM/2 + 0.5,  wM/2 - 0.5);
+      playerZ = THREE.MathUtils.clamp(playerZ, -hM/2 + 0.5,  hM/2 - 0.5);
+
+      const h = heightFromGridAtXZ(playerX, playerZ);
+      world.position.set(-playerX, -h, -playerZ);
+
+      teleportMarker.visible = true;
+      teleportMarker.position.set(p.x, p.y + 0.02, p.z);
+      setTimeout(()=> teleportMarker.visible=false, 350);
+      updateHUD(h, eyeHeight);
+    }
+  });
+}
+setupTeleportFor(controller0);
+setupTeleportFor(controller1);
+
+// Sun via controller buttons
+function pollControllerButtons() {
+  const session = renderer.xr.getSession?.();
+  if (!session) return;
+  for (const src of session.inputSources) {
+    const gp = src.gamepad;
+    if (!gp) continue;
+    const squeeze    = gp.buttons[1]?.pressed; // grip
+    const stickClick = gp.buttons[3]?.pressed; // stick
+    if (src.handedness === 'left') {
+      if (squeeze) { sunAz -= 0.02; updateSun(); }
+      if (stickClick) { sunEl = Math.max(0.05, sunEl - 0.02); updateSun(); }
+    } else if (src.handedness === 'right') {
+      if (squeeze) { sunAz += 0.02; updateSun(); }
+      if (stickClick) { sunEl = Math.min(1.3, sunEl + 0.02); updateSun(); }
+    }
+  }
+}
+
+// VR left-stick locomotion
+function vrMove(dt) {
+  const session = renderer.xr.getSession?.();
+  if (!session) return;
+
+  let leftAxes = null;
+  for (const src of session.inputSources) {
+    const gp = src.gamepad;
+    if (!gp) continue;
+    if (src.handedness === 'left') leftAxes = gp.axes;
+  }
+
+  const xrCam = renderer.xr.getCamera(camera);
+  const m = xrCam.matrixWorld;
+  const forward = new THREE.Vector3(m.elements[8], 0, m.elements[10]).normalize().negate(); // -Z
+  const right   = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0,1,0));
+
+  if (leftAxes) {
+    const moveX = leftAxes[0] || 0, moveY = leftAxes[1] || 0;
+    const mag = Math.hypot(moveX, moveY);
+    if (mag >= 0.05) {
+      const speed = 1.5;
+      const v = new THREE.Vector3()
+        .addScaledVector(right,  moveX)
+        .addScaledVector(forward,-moveY)
+        .normalize().multiplyScalar(speed * dt);
+      playerX += v.x; playerZ += v.z;
+
+      playerX = THREE.MathUtils.clamp(playerX, -wM/2 + 0.5,  wM/2 - 0.5);
+      playerZ = THREE.MathUtils.clamp(playerZ, -hM/2 + 0.5,  hM/2 - 0.5);
+    }
+  }
+
+  const h = heightFromGridAtXZ(playerX, playerZ);
+  world.position.set(-playerX, -h, -playerZ);
+
+  // Update laser lengths live
+  [controller0, controller1].forEach(ctrl=>{
+    const line = ctrl.getObjectByName('laser');
+    if (!line) return;
+    const hit = intersectFromController(ctrl);
+    line.scale.z = hit ? Math.min(hit.distance, 50) : 10;
+  });
+
+  pollControllerButtons();
+}
+
+/* -------- SUN CONTROLS + SCREENSHOT (desktop) -------- */
+addEventListener('keydown', (e)=>{
+  if (e.key === '1') { sunAz -= 0.05; updateSun(); }
+  if (e.key === '2') { sunAz += 0.05; updateSun(); }
+  if (e.key === '3') { sunEl = Math.min(1.3, sunEl + 0.03); updateSun(); }
+  if (e.key === '4') { sunEl = Math.max(0.05, sunEl - 0.03); updateSun(); }
+  if (e.key.toLowerCase() === 'p') {
+    const a = document.createElement('a');
+    a.download = 'moon_webxr.png';
+    a.href = renderer.domElement.toDataURL('image/png');
+    a.click();
+  }
+  if (e.key.toLowerCase() === 'l') {
+    toggleLighting();
+  }
+});
+
+/* -------- UI: Lighting & Site toggles -------- */
+document.getElementById('toggleLit').addEventListener('click', toggleLighting);
+function toggleLighting() {
+  forceUnlit = !forceUnlit;
+  litLabel.textContent = forceUnlit ? 'Unlit' : 'PBR';
+  const newMat = forceUnlit ? makeUnlit() : makePBR();
+  ground.material.dispose?.();
+  ground.material = newMat;
+}
+
+document.getElementById('toggleSite').addEventListener('click', async (e)=>{
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.innerHTML = `Site selection: <b>Loading…</b>`;
+  const next = (currentSiteIndex + 1) % SITES.length;
+  await loadSite(next);
+  btn.disabled = false;
+  btn.innerHTML = `Site selection: <b>${SITES[currentSiteIndex].name}</b>`;
+});
+
+/* -------- RESIZE & XR session events -------- */
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+renderer.xr.addEventListener('sessionstart', ()=>{
+  controls.enabled = false;
+  // align VR player with current desktop XZ
+  playerX = camera.position.x;
+  playerZ = camera.position.z;
+  const h = heightFromGridAtXZ(playerX, playerZ);
+  world.position.set(-playerX, -h, -playerZ);
+  updateHUD(h, eyeHeight);
+});
+renderer.xr.addEventListener('sessionend', ()=>{
+  controls.enabled = true;
+  world.position.set(0,0,0);
+});
+
+/* -------- MAIN LOOP -------- */
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(()=>{
+  const dt = Math.min(0.05, clock.getDelta());
+
+  // keep skydome centred on viewer
+  const viewer = renderer.xr.isPresenting ? renderer.xr.getCamera(camera) : camera;
+  sky.position.copy(viewer.position);
+
+  if (!renderer.xr.isPresenting) {
+    desktopMove(dt);
+    controls.update();
+  } else {
+    vrMove(dt);
+  }
+
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
+
